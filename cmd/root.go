@@ -4,6 +4,7 @@ import (
 	"errors"
 	"log"
 
+	"github.com/ViRb3/wgcf/v2/cmd/bot"
 	"github.com/ViRb3/wgcf/v2/cmd/generate"
 	"github.com/ViRb3/wgcf/v2/cmd/register"
 	. "github.com/ViRb3/wgcf/v2/cmd/shared"
@@ -43,6 +44,7 @@ func init() {
 	RootCmd.AddCommand(generate.Cmd)
 	RootCmd.AddCommand(status.Cmd)
 	RootCmd.AddCommand(trace.Cmd)
+	RootCmd.AddCommand(bot.Cmd)
 }
 
 var unsupportedConfigError viper.UnsupportedConfigError
@@ -64,4 +66,6 @@ func initConfigDefaults() {
 	viper.SetDefault(config.AccessToken, "")
 	viper.SetDefault(config.PrivateKey, "")
 	viper.SetDefault(config.LicenseKey, "")
+	viper.SetDefault("telegram_token", "")
+	viper.SetDefault("allowed_chat_ids", "")
 }

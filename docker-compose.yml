@@ -1,0 +1,12 @@
+services:
+  wgcf-bot:
+    image: matrix37/wgcf:latest
+    container_name: wgcf-bot
+    restart: unless-stopped
+    working_dir: /data
+    volumes:
+      - ./data:/data
+    environment:
+      - WGCF_TELEGRAM_TOKEN=YOUR_TELEGRAM_BOT_TOKEN_HERE
+      - WGCF_ALLOWED_CHAT_IDS=
+    command: ["bot"]
