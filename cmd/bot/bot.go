@@ -5,6 +5,8 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -92,11 +94,9 @@ func startBot() error {
 		}
 
 		// Check authorization
-		if len(allowedChatMap) > 0 {
-			if !allowedChatMap[update.Message.Chat.ID] {
-				log.Printf("Unauthorized access attempt by chat ID %d", update.Message.Chat.ID)
-				continue
-			}
+		if !isUserAuthorized(bot, update.Message) {
+			log.Printf("Unauthorized access attempt from chat ID %d (User ID: %d)", update.Message.Chat.ID, update.Message.From.ID)
+			continue
 		}
 
 		go handleMessage(bot, update.Message)
@@ -114,11 +114,22 @@ func handleMessage(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
 	mu.Lock()
 	defer mu.Unlock()
 
+	// Load individual user configuration based on sender ID
+	if err := loadUserConfig(msg.From.ID); err != nil {
+		log.Printf("Error loading configuration for user %d: %+v", msg.From.ID, err)
+		reply := tgbotapi.NewMessage(msg.Chat.ID, "❌ *Internal Error:* Failed to load user workspace.")
+		reply.ParseMode = tgbotapi.ModeMarkdown
+		bot.Send(reply)
+		return
+	}
+
 	cmd := msg.Command()
 	args := msg.CommandArguments()
 
 	var text string
 	var err error
+	isGroup := msg.Chat.Type != "private"
+	targetChatId := msg.From.ID // Send output to user's direct message (DM) to preserve privacy
 
 	log.Printf("[%s] Received command: /%s %s", msg.From.UserName, cmd, args)
 
@@ -126,16 +137,18 @@ func handleMessage(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
 	case "start", "help":
 		text = "*Cloudflare Warp Controller Bot*\n\n" +
 			"Available commands:\n" +
-			"• `/register` - Create a new Cloudflare Warp account\n" +
-			"• `/status` - Show Warp account and devices status\n" +
-			"• `/generate` - Generate and send WireGuard configuration\n" +
+			"• `/register` - Create your separate Cloudflare Warp account\n" +
+			"• `/status` - Show your Warp account and devices status\n" +
+			"• `/generate` - Generate and send your WireGuard configuration\n" +
 			"• `/update <license_key>` - Link Warp+ premium license key\n" +
 			"• `/trace` - Show Cloudflare Warp diagnostics\n" +
-			"• `/help` - Show this message"
-		reply := tgbotapi.NewMessage(msg.Chat.ID, text)
-		reply.ParseMode = tgbotapi.ModeMarkdown
-		bot.Send(reply)
-		return
+			"• `/help` - Show this message\n\n" +
+			"💡 *Note:* Responses with account/profile info will be sent directly to your DMs for security."
+		
+		// Allow /help in group so people can see commands, but otherwise prefer DM
+		if isGroup {
+			targetChatId = msg.Chat.ID
+		}
 
 	case "register":
 		text, err = handleRegister()
@@ -150,16 +163,34 @@ func handleMessage(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
 		return
 	default:
 		text = "Unknown command. Use /help for instructions."
+		if isGroup {
+			targetChatId = msg.Chat.ID
+		}
 	}
 
 	if err != nil {
 		log.Printf("Command error: %+v", err)
 		text = fmt.Sprintf("❌ *Error:*\n```\n%s\n```", err.Error())
+		// Show error in source chat
+		targetChatId = msg.Chat.ID
 	}
 
-	reply := tgbotapi.NewMessage(msg.Chat.ID, text)
+	reply := tgbotapi.NewMessage(targetChatId, text)
 	reply.ParseMode = tgbotapi.ModeMarkdown
-	bot.Send(reply)
+	_, sendErr := bot.Send(reply)
+
+	// If sending to DM failed (e.g., user hasn't started bot)
+	if sendErr != nil && isGroup && targetChatId == msg.From.ID {
+		log.Printf("Failed to DM user %d: %v", msg.From.ID, sendErr)
+		errorMsg := fmt.Sprintf("⚠️ @%s, I cannot send you Direct Messages. Please start a private chat with me first by clicking here: [Start Bot](https://t.me/%s) and try again.", msg.From.UserName, bot.Self.UserName)
+		groupReply := tgbotapi.NewMessage(msg.Chat.ID, errorMsg)
+		groupReply.ParseMode = tgbotapi.ModeMarkdown
+		bot.Send(groupReply)
+	} else if sendErr == nil && isGroup && targetChatId == msg.From.ID {
+		// Notify in group that the command was executed privately
+		groupReply := tgbotapi.NewMessage(msg.Chat.ID, fmt.Sprintf("📩 @%s, I have sent the response to your Direct Messages!", msg.From.UserName))
+		bot.Send(groupReply)
+	}
 }
 
 func handleRegister() (string, error) {
@@ -279,6 +310,9 @@ func handleTrace() (string, error) {
 }
 
 func handleGenerate(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
+	isGroup := msg.Chat.Type != "private"
+	targetChatId := msg.From.ID // Send to DM for privacy
+
 	if err := EnsureConfigValidAccount(); err != nil {
 		reply := tgbotapi.NewMessage(msg.Chat.ID, "❌ *Error:* No registered account found. Run /register first.")
 		reply.ParseMode = tgbotapi.ModeMarkdown
@@ -315,17 +349,29 @@ func handleGenerate(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
 		Bytes: []byte(profileStr),
 	}
 
-	docMsg := tgbotapi.NewDocument(msg.Chat.ID, fileBytes)
-	docMsg.Caption = "🔒 *Here is your WireGuard configuration profile!*"
+	docMsg := tgbotapi.NewDocument(targetChatId, fileBytes)
+	docMsg.Caption = "🔒 *Here is your private WireGuard configuration profile!*"
 	docMsg.ParseMode = tgbotapi.ModeMarkdown
 
-	_, err = bot.Send(docMsg)
-	if err != nil {
-		log.Printf("Failed to send document: %+v", err)
-		// Fallback send text
-		reply := tgbotapi.NewMessage(msg.Chat.ID, fmt.Sprintf("📁 *Profile config content:*\n```\n%s\n```", profileStr))
-		reply.ParseMode = tgbotapi.ModeMarkdown
-		bot.Send(reply)
+	_, sendErr := bot.Send(docMsg)
+	if sendErr != nil {
+		log.Printf("Failed to send document to user %d: %+v", msg.From.ID, sendErr)
+
+		if isGroup {
+			errorMsg := fmt.Sprintf("⚠️ @%s, I couldn't send your config privately. Please start a private chat with me first by clicking here: [Start Bot](https://t.me/%s) and try again.", msg.From.UserName, bot.Self.UserName)
+			groupReply := tgbotapi.NewMessage(msg.Chat.ID, errorMsg)
+			groupReply.ParseMode = tgbotapi.ModeMarkdown
+			bot.Send(groupReply)
+		} else {
+			// Fallback in private chat if document fails, just send text
+			reply := tgbotapi.NewMessage(targetChatId, fmt.Sprintf("📁 *Profile config content:*\n```\n%s\n```", profileStr))
+			reply.ParseMode = tgbotapi.ModeMarkdown
+			bot.Send(reply)
+		}
+	} else if isGroup {
+		// Success notification in group
+		groupReply := tgbotapi.NewMessage(msg.Chat.ID, fmt.Sprintf("📩 @%s, I have sent your WireGuard profile directly to your Private Messages!", msg.From.UserName))
+		bot.Send(groupReply)
 	}
 }
 
@@ -361,3 +407,79 @@ func formatAccountDetails(account *cloudflare.Account, boundDevices []cloudflare
 
 	return sb.String()
 }
+
+func loadUserConfig(userId int64) error {
+	userDir := filepath.Join("users", strconv.FormatInt(userId, 10))
+	if err := os.MkdirAll(userDir, 0755); err != nil {
+		return errors.WithStack(err)
+	}
+
+	configFile := filepath.Join(userDir, "wgcf-account.toml")
+
+	// Ensure config file exists so viper doesn't fail
+	if _, err := os.Stat(configFile); os.IsNotExist(err) {
+		f, err := os.Create(configFile)
+		if err != nil {
+			return errors.WithStack(err)
+		}
+		f.Close()
+	}
+
+	// Reset and re-load settings into global viper for the scope of this lock execution
+	viper.Reset()
+	viper.SetDefault(config.DeviceId, "")
+	viper.SetDefault(config.AccessToken, "")
+	viper.SetDefault(config.PrivateKey, "")
+	viper.SetDefault(config.LicenseKey, "")
+
+	viper.SetConfigFile(configFile)
+	viper.SetEnvPrefix("WGCF")
+	viper.AutomaticEnv()
+
+	// Read the user's configuration
+	_ = viper.ReadInConfig()
+
+	return nil
+}
+
+func isUserAuthorized(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) bool {
+	if len(allowedChatMap) == 0 {
+		return true
+	}
+
+	// 1. Direct match: Sent directly from an authorized Group or by an authorized User Chat ID
+	if allowedChatMap[msg.Chat.ID] {
+		return true
+	}
+
+	// 2. Explicit Sender match: Sender's User ID is explicitly in allowedChatMap
+	if allowedChatMap[msg.From.ID] {
+		return true
+	}
+
+	// 3. Group membership check: If message is from a private chat, check if user belongs to ANY authorized group
+	if msg.Chat.Type == "private" {
+		for chatId := range allowedChatMap {
+			// Group IDs are negative in Telegram
+			if chatId < 0 {
+				config := tgbotapi.GetChatMemberConfig{
+					ChatConfigWithUser: tgbotapi.ChatConfigWithUser{
+						ChatID: chatId,
+						UserID: msg.From.ID,
+					},
+				}
+				member, err := bot.GetChatMember(config)
+				if err == nil {
+					status := member.Status
+					if status == "creator" || status == "administrator" || status == "member" {
+						return true
+					}
+				}
+			}
+		}
+	}
+
+	return false
+}
+
+
