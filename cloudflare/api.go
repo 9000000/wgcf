@@ -2,7 +2,9 @@ package cloudflare
 
 import (
 	"crypto/tls"
+	"log"
 	"net/http"
+	"net/url"
 	"time"
 
 	"github.com/ViRb3/wgcf/v2/config"
@@ -28,8 +30,13 @@ var (
 			MinVersion: tls.VersionTLS12,
 			MaxVersion: tls.VersionTLS12},
 		ForceAttemptHTTP2: false,
-		// From http.DefaultTransport
-		Proxy:                 http.ProxyFromEnvironment,
+		// Dynamically resolve current active proxy from our managed pool
+		Proxy: func(req *http.Request) (*url.URL, error) {
+			if GlobalProxyManager.HasProxies() {
+				return GlobalProxyManager.GetProxy(req)
+			}
+			return http.ProxyFromEnvironment(req)
+		},
 		MaxIdleConns:          100,
 		IdleConnTimeout:       90 * time.Second,
 		TLSHandshakeTimeout:   10 * time.Second,
@@ -58,20 +65,60 @@ func MakeApiClient(authToken *string) *openapi.APIClient {
 }
 
 func Register(publicKey *wireguard.Key, deviceModel string) (*openapi.Register200Response, error) {
-	timestamp := util.GetTimestamp()
-	result, _, err := apiClient.DefaultAPI.
-		Register(nil, ApiVersion).
-		RegisterRequest(openapi.RegisterRequest{
-			FcmToken:  "", // not empty on actual client
-			InstallId: "", // not empty on actual client
-			Key:       publicKey.String(),
-			Locale:    "en_US",
-			Model:     deviceModel,
-			Tos:       timestamp,
-			Type:      "Android",
-		}).Execute()
-	return result, errors.WithStack(err)
+	// Force initial state to Direct Connection for the first attempt
+	GlobalProxyManager.SetEnabled(false)
+
+	maxRetries := 5
+	if !GlobalProxyManager.HasProxies() {
+		maxRetries = 1
+	}
+
+	var lastErr error
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		timestamp := util.GetTimestamp()
+
+		if attempt > 1 && GlobalProxyManager.HasProxies() {
+			// Turn proxy mode ON starting from second attempt onwards
+			GlobalProxyManager.SetEnabled(true)
+			log.Printf("Cloudflare API: [PROXY MODE] Register attempt %d/%d using Proxy: %s", attempt, maxRetries, GlobalProxyManager.GetCurrentProxyStr())
+		} else {
+			log.Printf("Cloudflare API: [DIRECT MODE] Register attempt %d/%d using Direct Connection", attempt, maxRetries)
+		}
+
+		result, _, err := apiClient.DefaultAPI.
+			Register(nil, ApiVersion).
+			RegisterRequest(openapi.RegisterRequest{
+				FcmToken:  "", // not empty on actual client
+				InstallId: "", // not empty on actual client
+				Key:       publicKey.String(),
+				Locale:    "en_US",
+				Model:     deviceModel,
+				Tos:       timestamp,
+				Type:      "Android",
+			}).Execute()
+
+		if err == nil {
+			log.Printf("Cloudflare API: Registration SUCCESSFUL on attempt %d!", attempt)
+			return result, nil
+		}
+
+		lastErr = err
+		log.Printf("Cloudflare API: Register failed (Attempt %d/%d): %v", attempt, maxRetries, err)
+
+		if attempt < maxRetries {
+			if attempt == 1 {
+				log.Printf("Cloudflare API: Direct connection failed. Activating dynamic proxy fallback pool for next retries...")
+			} else if GlobalProxyManager.HasProxies() {
+				log.Printf("Cloudflare API: Active proxy failed. Triggering rotation to next URL...")
+				GlobalProxyManager.Rotate()
+			}
+			time.Sleep(200 * time.Millisecond)
+		}
+	}
+
+	return nil, errors.WithStack(lastErr)
 }
+
 
 type SourceDevice openapi.GetSourceDevice200Response
 
@@ -83,10 +130,7 @@ func GetSourceDevice(ctx *config.Context) (*SourceDevice, error) {
 }
 
 func globalClientAuth(authToken string) *openapi.APIClient {
-	if apiClientAuth == nil {
-		apiClientAuth = MakeApiClient(&authToken)
-	}
-	return apiClientAuth
+	return MakeApiClient(&authToken)
 }
 
 type Account openapi.Account

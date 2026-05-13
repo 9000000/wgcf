@@ -1,0 +1,33 @@
+# Version control
+.git
+.github
+.gitignore
+
+# Docker files
+Dockerfile*
+docker-compose*
+.dockerignore
+
+# Sensitive / Dynamic Data (IMPORTANT)
+data/
+users/
+*.toml
+*.conf
+log.txt
+
+# Build / IDE local artifacts
+.idea/
+.vscode/
+bin/
+dist/
+wgcf
+wgcf.exe
+wgcf_test.exe
+
+# API specs & config not needed for runtime compilation
+openapi-spec.yml
+openapitools.json
+.goreleaser.yml
+.releaserc.json
+README.md
+LICENSE

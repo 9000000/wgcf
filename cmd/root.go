@@ -68,4 +68,5 @@ func initConfigDefaults() {
 	viper.SetDefault(config.LicenseKey, "")
 	viper.SetDefault("telegram_token", "")
 	viper.SetDefault("allowed_chat_ids", "")
+	viper.SetDefault("bot_reg_limit", 2)
 }

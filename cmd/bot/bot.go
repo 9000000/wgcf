@@ -1,6 +1,7 @@
 package bot
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -10,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/ViRb3/wgcf/v2/cloudflare"
 	. "github.com/ViRb3/wgcf/v2/cmd/shared"
@@ -23,10 +25,11 @@ import (
 )
 
 var (
-	tgToken         string
-	allowedChatIds  string
-	allowedChatMap  map[int64]bool
-	mu              sync.Mutex // Mutex to serialize wgcf operations due to single viper config file
+	tgToken        string
+	allowedChatIds string
+	allowedChatMap map[int64]bool
+	botRegLimit    int
+	mu             sync.Mutex // Mutex to serialize wgcf operations due to single viper config file
 )
 
 var Cmd = &cobra.Command{
@@ -43,6 +46,7 @@ var Cmd = &cobra.Command{
 func init() {
 	Cmd.PersistentFlags().StringVar(&tgToken, "token", "", "Telegram Bot Token (can also be set via WGCF_TELEGRAM_TOKEN env var)")
 	Cmd.PersistentFlags().StringVar(&allowedChatIds, "allowed-chat-ids", "", "Comma separated Telegram Chat IDs allowed to use the bot")
+	Cmd.PersistentFlags().IntVar(&botRegLimit, "reg-limit", 0, "Successful registration limit per rolling 7 days per user")
 }
 
 func startBot() error {
@@ -53,6 +57,30 @@ func startBot() error {
 	if allowedChatIds == "" {
 		allowedChatIds = viper.GetString("allowed_chat_ids")
 	}
+	if botRegLimit <= 0 {
+		botRegLimit = viper.GetInt("bot_reg_limit")
+	}
+	if botRegLimit <= 0 {
+		botRegLimit = 2 // Default limit
+	}
+
+	// Asynchronously initialize and periodically refresh the rotating proxy pool every 2 hours
+	go func() {
+		// Fetch immediately on boot
+		if err := cloudflare.GlobalProxyManager.LoadProxies(); err != nil {
+			log.Printf("ProxyManager WARNING: Could not retrieve proxy pool: %v. Will fallback to direct connections.", err)
+		}
+
+		ticker := time.NewTicker(2 * time.Hour)
+		defer ticker.Stop()
+
+		for range ticker.C {
+			log.Println("ProxyManager: Periodically refreshing latest proxy pool from GitHub source...")
+			if err := cloudflare.GlobalProxyManager.LoadProxies(); err != nil {
+				log.Printf("ProxyManager WARNING: Period refresh failed: %v. Retaining previous pool state.", err)
+			}
+		}
+	}()
 
 	if tgToken == "" {
 		return errors.New("Telegram Token is required. Set --token flag or WGCF_TELEGRAM_TOKEN environment variable")
@@ -141,23 +169,43 @@ func handleMessage(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
 			"• `/status` - Show your Warp account and devices status\n" +
 			"• `/generate` - Generate and send your WireGuard configuration\n" +
 			"• `/update <license_key>` - Link Warp+ premium license key\n" +
-			"• `/trace` - Show Cloudflare Warp diagnostics\n" +
+			"• `/reset` - Reset/Delete your current configuration\n" +
 			"• `/help` - Show this message\n\n" +
 			"💡 *Note:* Responses with account/profile info will be sent directly to your DMs for security."
-		
+
 		// Allow /help in group so people can see commands, but otherwise prefer DM
 		if isGroup {
 			targetChatId = msg.Chat.ID
 		}
 
 	case "register":
-		text, err = handleRegister()
+		// Enforce direct connection baseline at the start of the operation
+		cloudflare.GlobalProxyManager.SetEnabled(false)
+		// Guarantee proxy is switched back OFF when this command processing concludes
+		defer cloudflare.GlobalProxyManager.SetEnabled(false)
+
+		allowed, limitErr := checkRegLimit(msg.From.ID)
+		if limitErr != nil {
+			err = limitErr
+		} else if !allowed {
+			text = fmt.Sprintf("⚠️ *Giới hạn:* Bạn đã đạt mức tối đa đăng ký **%d lần thành công / 7 ngày**. Vui lòng quay lại thử lại sau!", botRegLimit)
+		} else {
+			text, err = handleRegister()
+			if err == nil {
+				_ = incrementRegLimit(msg.From.ID)
+				// Only increment proxy lifecycle counter if a proxy was actively engaged
+				if cloudflare.GlobalProxyManager.IsEnabled() {
+					cloudflare.GlobalProxyManager.IncrementUse()
+				}
+			}
+		}
+	case "reset":
+		text, err = handleReset(msg.From.ID)
 	case "status":
 		text, err = handleStatus()
 	case "update":
 		text, err = handleUpdate(args)
-	case "trace":
-		text, err = handleTrace()
+
 	case "generate":
 		handleGenerate(bot, msg)
 		return
@@ -203,7 +251,7 @@ func handleRegister() (string, error) {
 		return "", errors.WithStack(err)
 	}
 
-	device, err := cloudflare.Register(privateKey.Public(), "TelegramBot")
+	device, err := cloudflare.Register(privateKey.Public(), "PC")
 	if err != nil {
 		return "", errors.WithStack(err)
 	}
@@ -469,7 +517,9 @@ func isUserAuthorized(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) bool {
 					},
 				}
 				member, err := bot.GetChatMember(config)
-				if err == nil {
+				if err != nil {
+					log.Printf("Debug: GetChatMember error for User %d in Group %d: %v", msg.From.ID, chatId, err)
+				} else {
 					status := member.Status
 					if status == "creator" || status == "administrator" || status == "member" {
 						return true
@@ -482,4 +532,106 @@ func isUserAuthorized(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) bool {
 	return false
 }
 
+func handleReset(userId int64) (string, error) {
+	userDir := filepath.Join("users", strconv.FormatInt(userId, 10))
+	configFile := filepath.Join(userDir, "wgcf-account.toml")
+
+	// Check if file exists
+	if _, err := os.Stat(configFile); os.IsNotExist(err) {
+		return "ℹ️ You do not have an existing configuration to reset.", nil
+	}
+
+	// Delete the configuration file
+	if err := os.Remove(configFile); err != nil {
+		return "", errors.Wrap(err, "failed to delete configuration file")
+	}
+
+	// Force reset of global viper session immediately
+	viper.Reset()
+	viper.SetDefault(config.DeviceId, "")
+	viper.SetDefault(config.AccessToken, "")
+	viper.SetDefault(config.PrivateKey, "")
+	viper.SetDefault(config.LicenseKey, "")
+
+	log.Printf("User %d reset their configuration", userId)
+	return "✅ *Successfully reset!* Your local configuration has been completely deleted. You can now use `/register` to start over.", nil
+}
+
+type RegLimit struct {
+	Timestamps []int64 `json:"timestamps"`
+}
+
+func checkRegLimit(userId int64) (bool, error) {
+	userDir := filepath.Join("users", strconv.FormatInt(userId, 10))
+	limitFile := filepath.Join(userDir, "reg_limit.json")
+
+	if _, err := os.Stat(limitFile); os.IsNotExist(err) {
+		return true, nil
+	}
+
+	data, err := os.ReadFile(limitFile)
+	if err != nil {
+		return false, errors.WithStack(err)
+	}
+
+	var limit RegLimit
+	if err := json.Unmarshal(data, &limit); err != nil {
+		limit = RegLimit{}
+	}
+
+	now := time.Now().Unix()
+	sevenDaysInSecs := int64(7 * 24 * 60 * 60)
+	cutoff := now - sevenDaysInSecs
+
+	validCount := 0
+	for _, ts := range limit.Timestamps {
+		if ts > cutoff {
+			validCount++
+		}
+	}
+
+	if validCount >= botRegLimit {
+		return false, nil
+	}
+
+	return true, nil
+}
+
+func incrementRegLimit(userId int64) error {
+	userDir := filepath.Join("users", strconv.FormatInt(userId, 10))
+	limitFile := filepath.Join(userDir, "reg_limit.json")
+
+	if err := os.MkdirAll(userDir, 0755); err != nil {
+		return errors.WithStack(err)
+	}
+
+	var limit RegLimit
+	if data, err := os.ReadFile(limitFile); err == nil {
+		_ = json.Unmarshal(data, &limit)
+	}
+
+	now := time.Now().Unix()
+	sevenDaysInSecs := int64(7 * 24 * 60 * 60)
+	cutoff := now - sevenDaysInSecs
+
+	var newTimestamps []int64
+	for _, ts := range limit.Timestamps {
+		if ts > cutoff {
+			newTimestamps = append(newTimestamps, ts)
+		}
+	}
+	newTimestamps = append(newTimestamps, now)
+	limit.Timestamps = newTimestamps
+
+	data, err := json.MarshalIndent(limit, "", "  ")
+	if err != nil {
+		return errors.WithStack(err)
+	}
+
+	if err := os.WriteFile(limitFile, data, 0644); err != nil {
+		return errors.WithStack(err)
+	}
+
+	return nil
+}
 

@@ -9,4 +9,5 @@ services:
     environment:
       - WGCF_TELEGRAM_TOKEN=YOUR_TELEGRAM_BOT_TOKEN_HERE
       - WGCF_ALLOWED_CHAT_IDS=
+      - WGCF_BOT_REG_LIMIT=2
     command: ["bot"]
