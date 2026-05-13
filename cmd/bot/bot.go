@@ -163,15 +163,15 @@ func handleMessage(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
 
 	switch cmd {
 	case "start", "help":
-		text = "*Cloudflare Warp Controller Bot*\n\n" +
-			"Available commands:\n" +
-			"• `/register` - Create your separate Cloudflare Warp account\n" +
-			"• `/status` - Show your Warp account and devices status\n" +
-			"• `/generate` - Generate and send your WireGuard configuration\n" +
-			"• `/update <license_key>` - Link Warp+ premium license key\n" +
-			"• `/reset` - Reset/Delete your current configuration\n" +
-			"• `/help` - Show this message\n\n" +
-			"💡 *Note:* Responses with account/profile info will be sent directly to your DMs for security."
+		text = "*Hệ thống Quản lý Cloudflare Warp*\n\n" +
+			"Các lệnh hỗ trợ:\n" +
+			"• `/register` - Tạo mới tài khoản Cloudflare Warp (Tự gửi kèm cấu hình)\n" +
+			"• `/status` - Kiểm tra thông tin dung lượng & tài khoản\n" +
+			"• `/update <license_key>` - Kích hoạt Key Warp+ Premium\n" +
+			"• `/reset` - Xóa cấu hình hiện tại để đăng ký lại\n" +
+			"• `/help` - Hiển thị hướng dẫn này\n\n" +
+			"⚠️ *LƯU Ý GIỚI HẠN:* Mỗi người dùng chỉ được đăng ký thành công tối đa **" + strconv.Itoa(botRegLimit) + " lần / 7 ngày**.\n" +
+			"💡 *Bảo mật:* Trọn bộ file cấu hình (`.toml` & `.conf`) sẽ được gửi **tự động** vào mục Chat riêng của bạn."
 
 		// Allow /help in group so people can see commands, but otherwise prefer DM
 		if isGroup {
@@ -197,6 +197,8 @@ func handleMessage(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
 				if cloudflare.GlobalProxyManager.IsEnabled() {
 					cloudflare.GlobalProxyManager.IncrementUse()
 				}
+				// Automatically generate and deliver documents immediately
+				sendConfigFiles(bot, msg)
 			}
 		}
 	case "reset":
@@ -205,6 +207,9 @@ func handleMessage(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
 		text, err = handleStatus()
 	case "update":
 		text, err = handleUpdate(args)
+		if err == nil {
+			sendConfigFiles(bot, msg)
+		}
 
 	case "generate":
 		handleGenerate(bot, msg)
@@ -243,7 +248,7 @@ func handleMessage(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
 
 func handleRegister() (string, error) {
 	if err := EnsureNoExistingAccount(); err != nil {
-		return "", errors.New("An account is already registered. Use /status to check.")
+		return "", errors.New("⚠️ Bạn đã có tài khoản hoạt động trên hệ thống! Vui lòng dùng `/status` để xem thông tin hoặc `/reset` để xóa bỏ tài khoản cũ (Lưu ý giới hạn: Đăng ký lại tối đa " + strconv.Itoa(botRegLimit) + " lần / 7 ngày).")
 	}
 
 	privateKey, err := wireguard.NewPrivateKey()
@@ -280,7 +285,7 @@ func handleRegister() (string, error) {
 		return "", errors.WithStack(err)
 	}
 
-	return fmt.Sprintf("✅ *Successfully registered!*\n\n%s", formatAccountDetails(account, boundDevices)), nil
+	return fmt.Sprintf("✅ *Đăng ký Tài khoản Cloudflare Warp Thành công!*\n\n⚠️ *LƯU Ý QUAN TRỌNG:* Bạn đã sử dụng 1 lượt tạo tài khoản. Hệ thống chỉ cho phép đăng ký tối đa **%d lần thành công / 7 ngày** (Chống spam).\n\n%s", botRegLimit, formatAccountDetails(account, boundDevices)), nil
 }
 
 func handleStatus() (string, error) {
@@ -635,3 +640,71 @@ func incrementRegLimit(userId int64) error {
 	return nil
 }
 
+func sendConfigFiles(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
+	isGroup := msg.Chat.Type != "private"
+	targetChatId := msg.From.ID
+
+	// 1. Fetch toml contents
+	userDir := filepath.Join("users", strconv.FormatInt(msg.From.ID, 10))
+	tomlPath := filepath.Join(userDir, "wgcf-account.toml")
+	
+	tomlBytes, err := os.ReadFile(tomlPath)
+	if err != nil {
+		log.Printf("Config Delivery: Failed to read toml for sending: %v", err)
+		return
+	}
+
+	// 2. Acquire source device to construct wg profile conf
+	ctx := CreateContext()
+	thisDevice, err := cloudflare.GetSourceDevice(ctx)
+	if err != nil {
+		log.Printf("Config Delivery: Failed to load source device for profile: %v", err)
+		return
+	}
+
+	profile, err := wireguard.NewProfile(&wireguard.ProfileData{
+		PrivateKey: viper.GetString(config.PrivateKey),
+		Address1:   thisDevice.Config.Interface.Addresses.V4,
+		Address2:   thisDevice.Config.Interface.Addresses.V6,
+		PublicKey:  thisDevice.Config.Peers[0].PublicKey,
+		Endpoint:   thisDevice.Config.Peers[0].Endpoint.Host,
+	})
+	if err != nil {
+		log.Printf("Config Delivery: Failed to generate WireGuard profile: %v", err)
+		return
+	}
+	profileStr := profile.String()
+
+	// Stream documents to user privately
+	tomlDoc := tgbotapi.NewDocument(targetChatId, tgbotapi.FileBytes{
+		Name:  "wgcf-account.toml",
+		Bytes: tomlBytes,
+	})
+	tomlDoc.Caption = "📄 *File Tài khoản:* `wgcf-account.toml` (Bảo mật tuyệt đối, dùng để sao lưu)"
+	tomlDoc.ParseMode = tgbotapi.ModeMarkdown
+
+	confDoc := tgbotapi.NewDocument(targetChatId, tgbotapi.FileBytes{
+		Name:  "wgcf-profile.conf",
+		Bytes: []byte(profileStr),
+	})
+	confDoc.Caption = "🔒 *File Cấu hình WireGuard:* `wgcf-profile.conf` (Nạp trực tiếp vào app WireGuard/1.1.1.1)"
+	confDoc.ParseMode = tgbotapi.ModeMarkdown
+
+	// Perform deliveries
+	_, err1 := bot.Send(tomlDoc)
+	_, err2 := bot.Send(confDoc)
+
+	if err1 != nil || err2 != nil {
+		log.Printf("Config Delivery: Failed to route DMs to Telegram User ID %d", msg.From.ID)
+		if isGroup {
+			errorMsg := fmt.Sprintf("⚠️ @%s, Tôi không thể tự gửi file cấu hình qua Hộp thư riêng. Bạn vui lòng kích hoạt chat riêng bằng cách bấm vào đây: [Nhắn tin cho Bot](https://t.me/%s) rồi chạy lại lệnh nhé!", msg.From.UserName, bot.Self.UserName)
+			groupReply := tgbotapi.NewMessage(msg.Chat.ID, errorMsg)
+			groupReply.ParseMode = tgbotapi.ModeMarkdown
+			bot.Send(groupReply)
+		}
+	} else if isGroup {
+		// Brief notify success in channel group to maintain privacy
+		groupReply := tgbotapi.NewMessage(msg.Chat.ID, fmt.Sprintf("📩 @%s, Tôi đã gửi trọn bộ 2 file cấu hình (TOML & CONF) an toàn vào Inbox của bạn rồi nhé!", msg.From.UserName))
+		bot.Send(groupReply)
+	}
+}
