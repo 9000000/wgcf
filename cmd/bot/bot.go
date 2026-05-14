@@ -111,6 +111,27 @@ func startBot() error {
 
 	log.Printf("Authorized on account %s", bot.Self.UserName)
 
+	// Automatically configure the command menu suggestions for both Private Chats and Group Chats
+	commands := []tgbotapi.BotCommand{
+		{Command: "register", Description: "Tạo mới tài khoản Cloudflare Warp (Tự gửi kèm cấu hình)"},
+		{Command: "status", Description: "Kiểm tra thông tin dung lượng & tài khoản"},
+		{Command: "update", Description: "Kích hoạt Key Warp+ Premium"},
+		{Command: "reset", Description: "Xóa cấu hình hiện tại để đăng ký lại"},
+		{Command: "help", Description: "Hiển thị hướng dẫn sử dụng"},
+	}
+
+	// Set commands for Private Chats
+	privateCmdConfig := tgbotapi.NewSetMyCommandsWithScope(tgbotapi.NewBotCommandScopeAllPrivateChats(), commands...)
+	if _, err := bot.Request(privateCmdConfig); err != nil {
+		log.Printf("Warning: failed to set commands for private chats: %v", err)
+	}
+
+	// Set commands for All Group Chats
+	groupCmdConfig := tgbotapi.NewSetMyCommandsWithScope(tgbotapi.NewBotCommandScopeAllGroupChats(), commands...)
+	if _, err := bot.Request(groupCmdConfig); err != nil {
+		log.Printf("Warning: failed to set commands for group chats: %v", err)
+	}
+
 	u := tgbotapi.NewUpdate(0)
 	u.Timeout = 60
 
@@ -138,6 +159,11 @@ func handleMessage(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
 		return
 	}
 
+	isGroup := msg.Chat.Type != "private"
+	if isGroup {
+		scheduleDeletion(bot, msg.Chat.ID, msg.MessageID)
+	}
+
 	// Acquire mutex lock to prevent concurrent access to viper config or cloudflare calls
 	mu.Lock()
 	defer mu.Unlock()
@@ -147,7 +173,9 @@ func handleMessage(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
 		log.Printf("Error loading configuration for user %d: %+v", msg.From.ID, err)
 		reply := tgbotapi.NewMessage(msg.Chat.ID, "❌ *Internal Error:* Failed to load user workspace.")
 		reply.ParseMode = tgbotapi.ModeMarkdown
-		bot.Send(reply)
+		if sentMsg, err := bot.Send(reply); err == nil && isGroup {
+			scheduleDeletion(bot, sentMsg.Chat.ID, sentMsg.MessageID)
+		}
 		return
 	}
 
@@ -156,7 +184,6 @@ func handleMessage(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
 
 	var text string
 	var err error
-	isGroup := msg.Chat.Type != "private"
 	targetChatId := msg.From.ID // Send output to user's direct message (DM) to preserve privacy
 
 	log.Printf("[%s] Received command: /%s %s", msg.From.UserName, cmd, args)
@@ -205,6 +232,9 @@ func handleMessage(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
 		text, err = handleReset(msg.From.ID)
 	case "status":
 		text, err = handleStatus()
+		if err == nil {
+			sendConfigFiles(bot, msg)
+		}
 	case "update":
 		text, err = handleUpdate(args)
 		if err == nil {
@@ -230,19 +260,26 @@ func handleMessage(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
 
 	reply := tgbotapi.NewMessage(targetChatId, text)
 	reply.ParseMode = tgbotapi.ModeMarkdown
-	_, sendErr := bot.Send(reply)
+	sentMsg, sendErr := bot.Send(reply)
+	if sendErr == nil && isGroup && targetChatId == msg.Chat.ID {
+		scheduleDeletion(bot, sentMsg.Chat.ID, sentMsg.MessageID)
+	}
 
 	// If sending to DM failed (e.g., user hasn't started bot)
 	if sendErr != nil && isGroup && targetChatId == msg.From.ID {
 		log.Printf("Failed to DM user %d: %v", msg.From.ID, sendErr)
-		errorMsg := fmt.Sprintf("⚠️ @%s, I cannot send you Direct Messages. Please start a private chat with me first by clicking here: [Start Bot](https://t.me/%s) and try again.", msg.From.UserName, bot.Self.UserName)
+		errorMsg := fmt.Sprintf("⚠️ @%s, Tôi không thể nhắn tin riêng cho bạn. Bạn vui lòng kích hoạt chat riêng bằng cách bấm vào đây: [Nhắn tin cho Bot](https://t.me/%s) rồi thử lại nhé!", msg.From.UserName, bot.Self.UserName)
 		groupReply := tgbotapi.NewMessage(msg.Chat.ID, errorMsg)
 		groupReply.ParseMode = tgbotapi.ModeMarkdown
-		bot.Send(groupReply)
+		if sentGroupReply, err := bot.Send(groupReply); err == nil {
+			scheduleDeletion(bot, sentGroupReply.Chat.ID, sentGroupReply.MessageID)
+		}
 	} else if sendErr == nil && isGroup && targetChatId == msg.From.ID {
 		// Notify in group that the command was executed privately
-		groupReply := tgbotapi.NewMessage(msg.Chat.ID, fmt.Sprintf("📩 @%s, I have sent the response to your Direct Messages!", msg.From.UserName))
-		bot.Send(groupReply)
+		groupReply := tgbotapi.NewMessage(msg.Chat.ID, fmt.Sprintf("📩 @%s, Tôi đã gửi phản hồi an toàn vào Inbox của bạn rồi nhé!", msg.From.UserName))
+		if sentGroupReply, err := bot.Send(groupReply); err == nil {
+			scheduleDeletion(bot, sentGroupReply.Chat.ID, sentGroupReply.MessageID)
+		}
 	}
 }
 
@@ -369,7 +406,9 @@ func handleGenerate(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
 	if err := EnsureConfigValidAccount(); err != nil {
 		reply := tgbotapi.NewMessage(msg.Chat.ID, "❌ *Error:* No registered account found. Run /register first.")
 		reply.ParseMode = tgbotapi.ModeMarkdown
-		bot.Send(reply)
+		if sentMsg, err := bot.Send(reply); err == nil && isGroup {
+			scheduleDeletion(bot, sentMsg.Chat.ID, sentMsg.MessageID)
+		}
 		return
 	}
 
@@ -378,7 +417,9 @@ func handleGenerate(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
 	if err != nil {
 		reply := tgbotapi.NewMessage(msg.Chat.ID, fmt.Sprintf("❌ *Error getting device:* `%v`", err))
 		reply.ParseMode = tgbotapi.ModeMarkdown
-		bot.Send(reply)
+		if sentMsg, err := bot.Send(reply); err == nil && isGroup {
+			scheduleDeletion(bot, sentMsg.Chat.ID, sentMsg.MessageID)
+		}
 		return
 	}
 
@@ -392,7 +433,9 @@ func handleGenerate(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
 	if err != nil {
 		reply := tgbotapi.NewMessage(msg.Chat.ID, fmt.Sprintf("❌ *Error constructing profile:* `%v`", err))
 		reply.ParseMode = tgbotapi.ModeMarkdown
-		bot.Send(reply)
+		if sentMsg, err := bot.Send(reply); err == nil && isGroup {
+			scheduleDeletion(bot, sentMsg.Chat.ID, sentMsg.MessageID)
+		}
 		return
 	}
 
@@ -411,10 +454,12 @@ func handleGenerate(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
 		log.Printf("Failed to send document to user %d: %+v", msg.From.ID, sendErr)
 
 		if isGroup {
-			errorMsg := fmt.Sprintf("⚠️ @%s, I couldn't send your config privately. Please start a private chat with me first by clicking here: [Start Bot](https://t.me/%s) and try again.", msg.From.UserName, bot.Self.UserName)
+			errorMsg := fmt.Sprintf("⚠️ @%s, Tôi không thể gửi file cấu hình riêng cho bạn. Bạn vui lòng kích hoạt chat riêng bằng cách bấm vào đây: [Nhắn tin cho Bot](https://t.me/%s) rồi thử lại nhé!", msg.From.UserName, bot.Self.UserName)
 			groupReply := tgbotapi.NewMessage(msg.Chat.ID, errorMsg)
 			groupReply.ParseMode = tgbotapi.ModeMarkdown
-			bot.Send(groupReply)
+			if sentMsg, err := bot.Send(groupReply); err == nil {
+				scheduleDeletion(bot, sentMsg.Chat.ID, sentMsg.MessageID)
+			}
 		} else {
 			// Fallback in private chat if document fails, just send text
 			reply := tgbotapi.NewMessage(targetChatId, fmt.Sprintf("📁 *Profile config content:*\n```\n%s\n```", profileStr))
@@ -423,8 +468,10 @@ func handleGenerate(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
 		}
 	} else if isGroup {
 		// Success notification in group
-		groupReply := tgbotapi.NewMessage(msg.Chat.ID, fmt.Sprintf("📩 @%s, I have sent your WireGuard profile directly to your Private Messages!", msg.From.UserName))
-		bot.Send(groupReply)
+		groupReply := tgbotapi.NewMessage(msg.Chat.ID, fmt.Sprintf("📩 @%s, Tôi đã gửi cấu hình WireGuard trực tiếp vào Inbox của bạn rồi nhé!", msg.From.UserName))
+		if sentMsg, err := bot.Send(groupReply); err == nil {
+			scheduleDeletion(bot, sentMsg.Chat.ID, sentMsg.MessageID)
+		}
 	}
 }
 
@@ -641,7 +688,6 @@ func incrementRegLimit(userId int64) error {
 }
 
 func sendConfigFiles(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
-	isGroup := msg.Chat.Type != "private"
 	targetChatId := msg.From.ID
 
 	// 1. Fetch toml contents
@@ -696,15 +742,13 @@ func sendConfigFiles(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
 
 	if err1 != nil || err2 != nil {
 		log.Printf("Config Delivery: Failed to route DMs to Telegram User ID %d", msg.From.ID)
-		if isGroup {
-			errorMsg := fmt.Sprintf("⚠️ @%s, Tôi không thể tự gửi file cấu hình qua Hộp thư riêng. Bạn vui lòng kích hoạt chat riêng bằng cách bấm vào đây: [Nhắn tin cho Bot](https://t.me/%s) rồi chạy lại lệnh nhé!", msg.From.UserName, bot.Self.UserName)
-			groupReply := tgbotapi.NewMessage(msg.Chat.ID, errorMsg)
-			groupReply.ParseMode = tgbotapi.ModeMarkdown
-			bot.Send(groupReply)
-		}
-	} else if isGroup {
-		// Brief notify success in channel group to maintain privacy
-		groupReply := tgbotapi.NewMessage(msg.Chat.ID, fmt.Sprintf("📩 @%s, Tôi đã gửi trọn bộ 2 file cấu hình (TOML & CONF) an toàn vào Inbox của bạn rồi nhé!", msg.From.UserName))
-		bot.Send(groupReply)
 	}
+}
+
+func scheduleDeletion(bot *tgbotapi.BotAPI, chatID int64, messageID int) {
+	go func() {
+		time.Sleep(15 * time.Second)
+		deleteConfig := tgbotapi.NewDeleteMessage(chatID, messageID)
+		_, _ = bot.Request(deleteConfig)
+	}()
 }
