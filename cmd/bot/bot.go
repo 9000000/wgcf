@@ -164,6 +164,16 @@ func handleMessage(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
 		scheduleDeletion(bot, msg.Chat.ID, msg.MessageID)
 	}
 
+	// Reject Telegram's built-in @GroupAnonymousBot (ID 1087968824) to prevent config conflicts and broken DMs
+	if msg.From != nil && msg.From.ID == 1087968824 {
+		reply := tgbotapi.NewMessage(msg.Chat.ID, "⚠️ *Lỗi:* Vui lòng không sử dụng chế độ Ẩn danh (Remain Anonymous) hoặc chat dưới danh nghĩa Channel khi tương tác với Bot. Bạn cần gọi lệnh bằng tài khoản cá nhân để Bot có thể gửi file cấu hình riêng tư vào Inbox!")
+		reply.ParseMode = tgbotapi.ModeMarkdown
+		if sentMsg, err := bot.Send(reply); err == nil && isGroup {
+			scheduleDeletion(bot, sentMsg.Chat.ID, sentMsg.MessageID)
+		}
+		return
+	}
+
 	// Acquire mutex lock to prevent concurrent access to viper config or cloudflare calls
 	mu.Lock()
 	defer mu.Unlock()
@@ -268,7 +278,7 @@ func handleMessage(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
 	// If sending to DM failed (e.g., user hasn't started bot)
 	if sendErr != nil && isGroup && targetChatId == msg.From.ID {
 		log.Printf("Failed to DM user %d: %v", msg.From.ID, sendErr)
-		errorMsg := fmt.Sprintf("⚠️ @%s, Tôi không thể nhắn tin riêng cho bạn. Bạn vui lòng kích hoạt chat riêng bằng cách bấm vào đây: [Nhắn tin cho Bot](https://t.me/%s) rồi thử lại nhé!", msg.From.UserName, bot.Self.UserName)
+		errorMsg := fmt.Sprintf("⚠️ @%s, Tôi đã nhắn tin riêng cho bạn. Hãy bấm vào đây: Nhắn tin cho Bot (https://t.me/%s) rồi thử lại nhé!", msg.From.UserName, bot.Self.UserName)
 		groupReply := tgbotapi.NewMessage(msg.Chat.ID, errorMsg)
 		groupReply.ParseMode = tgbotapi.ModeMarkdown
 		if sentGroupReply, err := bot.Send(groupReply); err == nil {
@@ -454,7 +464,7 @@ func handleGenerate(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
 		log.Printf("Failed to send document to user %d: %+v", msg.From.ID, sendErr)
 
 		if isGroup {
-			errorMsg := fmt.Sprintf("⚠️ @%s, Tôi không thể gửi file cấu hình riêng cho bạn. Bạn vui lòng kích hoạt chat riêng bằng cách bấm vào đây: [Nhắn tin cho Bot](https://t.me/%s) rồi thử lại nhé!", msg.From.UserName, bot.Self.UserName)
+			errorMsg := fmt.Sprintf("⚠️ @%s, Tôi đã nhắn tin riêng cho bạn. Hãy bấm vào đây: Nhắn tin cho Bot (https://t.me/%s) rồi thử lại nhé!", msg.From.UserName, bot.Self.UserName)
 			groupReply := tgbotapi.NewMessage(msg.Chat.ID, errorMsg)
 			groupReply.ParseMode = tgbotapi.ModeMarkdown
 			if sentMsg, err := bot.Send(groupReply); err == nil {
