@@ -159,7 +159,30 @@ func handleMessage(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
 		return
 	}
 
+	cmd := msg.Command()
+	cmdWithAt := msg.CommandWithAt()
+
+	// Ignore commands explicitly directed at another bot
+	if strings.Contains(cmdWithAt, "@") {
+		if !strings.HasSuffix(strings.ToLower(cmdWithAt), "@"+strings.ToLower(bot.Self.UserName)) {
+			return
+		}
+	}
+
 	isGroup := msg.Chat.Type != "private"
+
+	// Check if the command is supported
+	isSupported := false
+	switch cmd {
+	case "start", "help", "register", "reset", "status", "update", "generate":
+		isSupported = true
+	}
+
+	// Ignore unsupported commands in groups to avoid spamming
+	if !isSupported && isGroup {
+		return
+	}
+
 	if isGroup {
 		scheduleDeletion(bot, msg.Chat.ID, msg.MessageID)
 	}
@@ -171,6 +194,13 @@ func handleMessage(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
 		if sentMsg, err := bot.Send(reply); err == nil && isGroup {
 			scheduleDeletion(bot, sentMsg.Chat.ID, sentMsg.MessageID)
 		}
+		return
+	}
+
+	// For private chats, handle unsupported commands early
+	if !isSupported {
+		reply := tgbotapi.NewMessage(msg.Chat.ID, "Unknown command. Use /help for instructions.")
+		bot.Send(reply)
 		return
 	}
 
@@ -189,7 +219,7 @@ func handleMessage(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
 		return
 	}
 
-	cmd := msg.Command()
+	// cmd is already extracted above
 	args := msg.CommandArguments()
 
 	var text string
@@ -255,10 +285,8 @@ func handleMessage(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
 		handleGenerate(bot, msg)
 		return
 	default:
-		text = "Unknown command. Use /help for instructions."
-		if isGroup {
-			targetChatId = msg.Chat.ID
-		}
+		// Should not be reached due to early isSupported check
+		return
 	}
 
 	if err != nil {
