@@ -27,8 +27,10 @@ var (
 	DefaultTransport = &http.Transport{
 		// Match app's TLS config or API will reject us with code 403 error 1020
 		TLSClientConfig: &tls.Config{
-			MinVersion: tls.VersionTLS12,
-			MaxVersion: tls.VersionTLS12},
+			MinVersion:         tls.VersionTLS12,
+			MaxVersion:         tls.VersionTLS12,
+			InsecureSkipVerify: true,
+		},
 		ForceAttemptHTTP2: false,
 		// Dynamically resolve current active proxy from our managed pool
 		Proxy: func(req *http.Request) (*url.URL, error) {

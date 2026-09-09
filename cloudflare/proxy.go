@@ -2,6 +2,7 @@ package cloudflare
 
 import (
 	"bufio"
+	"crypto/tls"
 	"fmt"
 	"log"
 	"net/http"
@@ -30,7 +31,12 @@ func (m *ProxyManager) LoadProxies() error {
 	defer m.mu.Unlock()
 
 	log.Printf("ProxyManager: Fetching latest proxy list from %s", ProxyListURL)
-	client := &http.Client{Timeout: 15 * time.Second}
+	client := &http.Client{
+		Timeout: 15 * time.Second,
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+		},
+	}
 	resp, err := client.Get(ProxyListURL)
 	if err != nil {
 		return fmt.Errorf("failed to fetch proxy list: %w", err)

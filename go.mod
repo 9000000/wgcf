@@ -2,6 +2,9 @@ module github.com/ViRb3/wgcf/v2
 
 go 1.24.0
 
+// Preserve the TLS fingerprint used by releases before v2.2.31.
+godebug tlssha1=1
+
 toolchain go1.24.1
 
 require (
