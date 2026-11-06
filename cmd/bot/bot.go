@@ -3,6 +3,7 @@ package bot
 import (
 	"encoding/json"
 	"fmt"
+	"html"
 	"io"
 	"log"
 	"net/http"
@@ -126,35 +127,63 @@ func startBot() error {
 		log.Printf("Warning: failed to set commands for private chats: %v", err)
 	}
 
-	// Set commands for All Group Chats
-	groupCmdConfig := tgbotapi.NewSetMyCommandsWithScope(tgbotapi.NewBotCommandScopeAllGroupChats(), commands...)
-	if _, err := bot.Request(groupCmdConfig); err != nil {
-		log.Printf("Warning: failed to set commands for group chats: %v", err)
+	// Ephemeral commands hide menu-selected group commands from other members.
+	if err := setGroupCommandsEphemeral(bot, commands); err != nil {
+		log.Printf("Warning: failed to set group commands: %v", err)
 	}
 
-	u := tgbotapi.NewUpdate(0)
-	u.Timeout = 60
-
-	updates := bot.GetUpdatesChan(u)
-
-	for update := range updates {
-		if update.Message == nil {
+	lastUpdateID := 0
+	for {
+		data, err := telegramJSONRequest(bot, "getUpdates", map[string]int{
+			"offset":  lastUpdateID + 1,
+			"timeout": 60,
+		})
+		if err != nil {
+			log.Printf("Telegram getUpdates failed: %v", err)
+			time.Sleep(3 * time.Second)
 			continue
 		}
 
-		// Check authorization
-		if !isUserAuthorized(bot, update.Message) {
-			log.Printf("Unauthorized access attempt from chat ID %d (User ID: %d)", update.Message.Chat.ID, update.Message.From.ID)
+		var updates []rawIncomingUpdate
+		if err := json.Unmarshal(data, &updates); err != nil {
+			log.Printf("Could not decode Telegram updates: %v", err)
+			time.Sleep(3 * time.Second)
 			continue
 		}
+		for _, raw := range updates {
+			update, ref := raw.toUpdate()
+			lastUpdateID = update.UpdateID
+			if ref != nil {
+				incomingEphemeralCommands.Store(update.UpdateID, *ref)
+				updateID := update.UpdateID
+				time.AfterFunc(2*time.Minute, func() {
+					incomingEphemeralCommands.Delete(updateID)
+				})
+				log.Printf("Received ephemeral command (chat=%d receiver=%d message=%d)", ref.ChatID, ref.ReceiverID, ref.MessageID)
+			}
+			if update.Message == nil {
+				continue
+			}
 
-		go handleMessage(bot, update.Message)
+			if !isUserAuthorized(bot, update.Message) {
+				userID := int64(0)
+				if update.Message.From != nil {
+					userID = update.Message.From.ID
+				}
+				log.Printf("Unauthorized access attempt from chat ID %d (User ID: %d)", update.Message.Chat.ID, userID)
+				continue
+			}
+
+			threadID := 0
+			if raw.Message != nil {
+				threadID = raw.Message.MessageThreadID
+			}
+			go handleMessage(bot, update.Message, update.UpdateID, threadID)
+		}
 	}
-
-	return nil
 }
 
-func handleMessage(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
+func handleMessage(bot *tgbotapi.BotAPI, msg *tgbotapi.Message, updateID, threadID int) {
 	if !msg.IsCommand() {
 		return
 	}
@@ -184,15 +213,18 @@ func handleMessage(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
 	}
 
 	if isGroup {
-		scheduleDeletion(bot, msg.Chat.ID, msg.MessageID)
+		scheduleCommandDeletion(bot, updateID, msg, 3*time.Second)
 	}
 
 	// Reject Telegram's built-in @GroupAnonymousBot (ID 1087968824) to prevent config conflicts and broken DMs
 	if msg.From != nil && msg.From.ID == 1087968824 {
-		reply := tgbotapi.NewMessage(msg.Chat.ID, "⚠️ *Lỗi:* Vui lòng không sử dụng chế độ Ẩn danh (Remain Anonymous) hoặc chat dưới danh nghĩa Channel khi tương tác với Bot. Bạn cần gọi lệnh bằng tài khoản cá nhân để Bot có thể gửi file cấu hình riêng tư vào Inbox!")
-		reply.ParseMode = tgbotapi.ModeMarkdown
-		if sentMsg, err := bot.Send(reply); err == nil && isGroup {
-			scheduleDeletion(bot, sentMsg.Chat.ID, sentMsg.MessageID)
+		text := "⚠️ *Lỗi:* Vui lòng không sử dụng chế độ Ẩn danh (Remain Anonymous) hoặc chat dưới danh nghĩa Channel khi tương tác với Bot. Bạn cần gọi lệnh bằng tài khoản cá nhân để Bot có thể gửi file cấu hình riêng tư vào Inbox!"
+		if isGroup {
+			_ = sendGroupCommandReply(bot, msg, threadID, text, tgbotapi.ModeMarkdown, 10*time.Second)
+		} else {
+			reply := tgbotapi.NewMessage(msg.Chat.ID, text)
+			reply.ParseMode = tgbotapi.ModeMarkdown
+			_, _ = bot.Send(reply)
 		}
 		return
 	}
@@ -211,10 +243,13 @@ func handleMessage(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
 	// Load individual user configuration based on sender ID
 	if err := loadUserConfig(msg.From.ID); err != nil {
 		log.Printf("Error loading configuration for user %d: %+v", msg.From.ID, err)
-		reply := tgbotapi.NewMessage(msg.Chat.ID, "❌ *Internal Error:* Failed to load user workspace.")
-		reply.ParseMode = tgbotapi.ModeMarkdown
-		if sentMsg, err := bot.Send(reply); err == nil && isGroup {
-			scheduleDeletion(bot, sentMsg.Chat.ID, sentMsg.MessageID)
+		text := "❌ *Internal Error:* Failed to load user workspace."
+		if isGroup {
+			_ = sendGroupCommandReply(bot, msg, threadID, text, tgbotapi.ModeMarkdown, 10*time.Second)
+		} else {
+			reply := tgbotapi.NewMessage(msg.Chat.ID, text)
+			reply.ParseMode = tgbotapi.ModeMarkdown
+			_, _ = bot.Send(reply)
 		}
 		return
 	}
@@ -282,48 +317,49 @@ func handleMessage(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
 		}
 
 	case "generate":
-		handleGenerate(bot, msg)
+		handleGenerate(bot, msg, threadID)
 		return
 	default:
 		// Should not be reached due to early isSupported check
 		return
 	}
 
+	parseMode := tgbotapi.ModeMarkdown
+	if cmd == "register" || cmd == "status" || cmd == "update" {
+		parseMode = tgbotapi.ModeHTML
+	}
 	if err != nil {
 		log.Printf("Command error: %+v", err)
-		text = fmt.Sprintf("❌ *Error:*\n```\n%s\n```", err.Error())
+		text = fmt.Sprintf("❌ Error:\n%s", err.Error())
+		parseMode = ""
 		// Show error in source chat
 		targetChatId = msg.Chat.ID
 	}
 
-	reply := tgbotapi.NewMessage(targetChatId, text)
-	reply.ParseMode = tgbotapi.ModeMarkdown
-	sentMsg, sendErr := bot.Send(reply)
-	if sendErr == nil && isGroup && targetChatId == msg.Chat.ID {
-		scheduleDeletion(bot, sentMsg.Chat.ID, sentMsg.MessageID)
+	var sendErr error
+	if isGroup && targetChatId == msg.Chat.ID {
+		sendErr = sendGroupCommandReply(bot, msg, threadID, text, parseMode, 15*time.Second)
+	} else {
+		reply := tgbotapi.NewMessage(targetChatId, text)
+		reply.ParseMode = parseMode
+		_, sendErr = bot.Send(reply)
 	}
 
 	// If sending to DM failed (e.g., user hasn't started bot)
 	if sendErr != nil && isGroup && targetChatId == msg.From.ID {
 		log.Printf("Failed to DM user %d: %v", msg.From.ID, sendErr)
 		errorMsg := fmt.Sprintf("⚠️ @%s, Tôi đã nhắn tin riêng cho bạn. Hãy bấm vào đây: Nhắn tin cho Bot (https://t.me/%s) rồi thử lại nhé!", msg.From.UserName, bot.Self.UserName)
-		groupReply := tgbotapi.NewMessage(msg.Chat.ID, errorMsg)
-		groupReply.ParseMode = tgbotapi.ModeMarkdown
-		if sentGroupReply, err := bot.Send(groupReply); err == nil {
-			scheduleDeletion(bot, sentGroupReply.Chat.ID, sentGroupReply.MessageID)
-		}
+		_ = sendGroupCommandReply(bot, msg, threadID, errorMsg, "", 5*time.Second)
 	} else if sendErr == nil && isGroup && targetChatId == msg.From.ID {
 		// Notify in group that the command was executed privately
-		groupReply := tgbotapi.NewMessage(msg.Chat.ID, fmt.Sprintf("📩 @%s, Tôi đã gửi phản hồi an toàn vào Inbox của bạn rồi nhé!", msg.From.UserName))
-		if sentGroupReply, err := bot.Send(groupReply); err == nil {
-			scheduleDeletion(bot, sentGroupReply.Chat.ID, sentGroupReply.MessageID)
-		}
+		groupReply := fmt.Sprintf("📩 @%s, Tôi đã gửi phản hồi an toàn vào Inbox của bạn rồi nhé!", msg.From.UserName)
+		_ = sendGroupCommandReply(bot, msg, threadID, groupReply, "", 5*time.Second)
 	}
 }
 
 func handleRegister() (string, error) {
 	if err := EnsureNoExistingAccount(); err != nil {
-		return "", errors.New("⚠️ Bạn đã có tài khoản hoạt động trên hệ thống! Vui lòng dùng `/status` để xem thông tin hoặc `/reset` để xóa bỏ tài khoản cũ (Lưu ý giới hạn: Đăng ký lại tối đa " + strconv.Itoa(botRegLimit) + " lần / 7 ngày).")
+		return "", errors.New("⚠️ Bạn đã có tài khoản hoạt động trên hệ thống! Vui lòng dùng /status để xem thông tin hoặc /reset để xóa bỏ tài khoản cũ (Lưu ý giới hạn: Đăng ký lại tối đa " + strconv.Itoa(botRegLimit) + " lần / 7 ngày).")
 	}
 
 	privateKey, err := wireguard.NewPrivateKey()
@@ -360,7 +396,7 @@ func handleRegister() (string, error) {
 		return "", errors.WithStack(err)
 	}
 
-	return fmt.Sprintf("✅ *Đăng ký Tài khoản Cloudflare Warp Thành công!*\n\n⚠️ *LƯU Ý QUAN TRỌNG:* Bạn đã sử dụng 1 lượt tạo tài khoản. Hệ thống chỉ cho phép đăng ký tối đa **%d lần thành công / 7 ngày** (Chống spam).\n\n%s", botRegLimit, formatAccountDetails(account, boundDevices)), nil
+	return fmt.Sprintf("✅ <b>Đăng ký Tài khoản Cloudflare Warp Thành công!</b>\n\n⚠️ <b>LƯU Ý QUAN TRỌNG:</b> Bạn đã sử dụng 1 lượt tạo tài khoản. Hệ thống chỉ cho phép đăng ký tối đa <b>%d lần thành công / 7 ngày</b> (Chống spam).\n\n%s", botRegLimit, formatAccountDetails(account, boundDevices)), nil
 }
 
 func handleStatus() (string, error) {
@@ -419,7 +455,7 @@ func handleUpdate(args string) (string, error) {
 		return "", errors.WithStack(err)
 	}
 
-	return fmt.Sprintf("✅ *Successfully updated license!*\n\n%s", formatAccountDetails(account, boundDevices)), nil
+	return fmt.Sprintf("✅ <b>Successfully updated license!</b>\n\n%s", formatAccountDetails(account, boundDevices)), nil
 }
 
 func handleTrace() (string, error) {
@@ -437,15 +473,17 @@ func handleTrace() (string, error) {
 	return fmt.Sprintf("🌐 *Trace Result:*\n```\n%s\n```", strings.TrimSpace(string(bodyBytes))), nil
 }
 
-func handleGenerate(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
+func handleGenerate(bot *tgbotapi.BotAPI, msg *tgbotapi.Message, threadID int) {
 	isGroup := msg.Chat.Type != "private"
 	targetChatId := msg.From.ID // Send to DM for privacy
 
 	if err := EnsureConfigValidAccount(); err != nil {
-		reply := tgbotapi.NewMessage(msg.Chat.ID, "❌ *Error:* No registered account found. Run /register first.")
-		reply.ParseMode = tgbotapi.ModeMarkdown
-		if sentMsg, err := bot.Send(reply); err == nil && isGroup {
-			scheduleDeletion(bot, sentMsg.Chat.ID, sentMsg.MessageID)
+		text := "❌ Error: No registered account found. Run /register first."
+		if isGroup {
+			_ = sendGroupCommandReply(bot, msg, threadID, text, "", 10*time.Second)
+		} else {
+			reply := tgbotapi.NewMessage(msg.Chat.ID, text)
+			_, _ = bot.Send(reply)
 		}
 		return
 	}
@@ -453,10 +491,12 @@ func handleGenerate(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
 	ctx := CreateContext()
 	thisDevice, err := cloudflare.GetSourceDevice(ctx)
 	if err != nil {
-		reply := tgbotapi.NewMessage(msg.Chat.ID, fmt.Sprintf("❌ *Error getting device:* `%v`", err))
-		reply.ParseMode = tgbotapi.ModeMarkdown
-		if sentMsg, err := bot.Send(reply); err == nil && isGroup {
-			scheduleDeletion(bot, sentMsg.Chat.ID, sentMsg.MessageID)
+		text := fmt.Sprintf("❌ Error getting device: %v", err)
+		if isGroup {
+			_ = sendGroupCommandReply(bot, msg, threadID, text, "", 10*time.Second)
+		} else {
+			reply := tgbotapi.NewMessage(msg.Chat.ID, text)
+			_, _ = bot.Send(reply)
 		}
 		return
 	}
@@ -469,10 +509,12 @@ func handleGenerate(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
 		Endpoint:   thisDevice.Config.Peers[0].Endpoint.Host,
 	})
 	if err != nil {
-		reply := tgbotapi.NewMessage(msg.Chat.ID, fmt.Sprintf("❌ *Error constructing profile:* `%v`", err))
-		reply.ParseMode = tgbotapi.ModeMarkdown
-		if sentMsg, err := bot.Send(reply); err == nil && isGroup {
-			scheduleDeletion(bot, sentMsg.Chat.ID, sentMsg.MessageID)
+		text := fmt.Sprintf("❌ Error constructing profile: %v", err)
+		if isGroup {
+			_ = sendGroupCommandReply(bot, msg, threadID, text, "", 10*time.Second)
+		} else {
+			reply := tgbotapi.NewMessage(msg.Chat.ID, text)
+			_, _ = bot.Send(reply)
 		}
 		return
 	}
@@ -493,11 +535,7 @@ func handleGenerate(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
 
 		if isGroup {
 			errorMsg := fmt.Sprintf("⚠️ @%s, Tôi đã nhắn tin riêng cho bạn. Hãy bấm vào đây: Nhắn tin cho Bot (https://t.me/%s) rồi thử lại nhé!", msg.From.UserName, bot.Self.UserName)
-			groupReply := tgbotapi.NewMessage(msg.Chat.ID, errorMsg)
-			groupReply.ParseMode = tgbotapi.ModeMarkdown
-			if sentMsg, err := bot.Send(groupReply); err == nil {
-				scheduleDeletion(bot, sentMsg.Chat.ID, sentMsg.MessageID)
-			}
+			_ = sendGroupCommandReply(bot, msg, threadID, errorMsg, "", 5*time.Second)
 		} else {
 			// Fallback in private chat if document fails, just send text
 			reply := tgbotapi.NewMessage(targetChatId, fmt.Sprintf("📁 *Profile config content:*\n```\n%s\n```", profileStr))
@@ -506,32 +544,30 @@ func handleGenerate(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
 		}
 	} else if isGroup {
 		// Success notification in group
-		groupReply := tgbotapi.NewMessage(msg.Chat.ID, fmt.Sprintf("📩 @%s, Tôi đã gửi cấu hình WireGuard trực tiếp vào Inbox của bạn rồi nhé!", msg.From.UserName))
-		if sentMsg, err := bot.Send(groupReply); err == nil {
-			scheduleDeletion(bot, sentMsg.Chat.ID, sentMsg.MessageID)
-		}
+		groupReply := fmt.Sprintf("📩 @%s, Tôi đã gửi cấu hình WireGuard trực tiếp vào Inbox của bạn rồi nhé!", msg.From.UserName)
+		_ = sendGroupCommandReply(bot, msg, threadID, groupReply, "", 5*time.Second)
 	}
 }
 
 func formatAccountDetails(account *cloudflare.Account, boundDevices []cloudflare.BoundDevice) string {
 	var sb strings.Builder
 
-	sb.WriteString("👤 *Account Status:*\n")
-	sb.WriteString(fmt.Sprintf("• ID: `%s`\n", account.Id))
-	sb.WriteString(fmt.Sprintf("• Type: *%s*\n", account.AccountType))
-	sb.WriteString(fmt.Sprintf("• Quota: `%s`\n", humanize.Bytes(uint64(account.Quota))))
-	sb.WriteString(fmt.Sprintf("• Premium Data: `%s`\n", humanize.Bytes(uint64(account.PremiumData))))
-	sb.WriteString(fmt.Sprintf("• Role: `%s`\n", account.Role))
-	sb.WriteString("\n📱 *Devices linked:*")
+	sb.WriteString("👤 <b>Account Status:</b>\n")
+	sb.WriteString(fmt.Sprintf("• ID: <code>%s</code>\n", html.EscapeString(account.Id)))
+	sb.WriteString(fmt.Sprintf("• Type: <b>%s</b>\n", html.EscapeString(account.AccountType)))
+	sb.WriteString(fmt.Sprintf("• Quota: <code>%s</code>\n", humanize.Bytes(uint64(account.Quota))))
+	sb.WriteString(fmt.Sprintf("• Premium Data: <code>%s</code>\n", humanize.Bytes(uint64(account.PremiumData))))
+	sb.WriteString(fmt.Sprintf("• Role: <code>%s</code>\n", html.EscapeString(account.Role)))
+	sb.WriteString("\n📱 <b>Devices linked:</b>")
 
 	for i, device := range boundDevices {
 		name := "N/A"
 		if device.Name != nil {
-			name = *device.Name
+			name = html.EscapeString(*device.Name)
 		}
 		current := ""
 		if device.Id == viper.GetString(config.DeviceId) {
-			current = " *(Current)*"
+			current = " <i>(Current)</i>"
 		}
 
 		statusEmoji := "⚪️"
@@ -539,8 +575,12 @@ func formatAccountDetails(account *cloudflare.Account, boundDevices []cloudflare
 			statusEmoji = "🟢"
 		}
 
-		sb.WriteString(fmt.Sprintf("\n%d. %s %s `%s`%s", i+1, statusEmoji, name, device.Id, current))
-		sb.WriteString(fmt.Sprintf("\n   • Model: %s (%s)", device.Model, device.Type))
+		sb.WriteString(fmt.Sprintf("\n%d. %s %s <code>%s</code>%s", i+1, statusEmoji, name, html.EscapeString(device.Id), current))
+		model := "N/A"
+		if device.Model != nil {
+			model = html.EscapeString(*device.Model)
+		}
+		sb.WriteString(fmt.Sprintf("\n   • Model: %s (%s)", model, html.EscapeString(device.Type)))
 	}
 
 	return sb.String()
@@ -731,7 +771,7 @@ func sendConfigFiles(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
 	// 1. Fetch toml contents
 	userDir := filepath.Join("users", strconv.FormatInt(msg.From.ID, 10))
 	tomlPath := filepath.Join(userDir, "wgcf-account.toml")
-	
+
 	tomlBytes, err := os.ReadFile(tomlPath)
 	if err != nil {
 		log.Printf("Config Delivery: Failed to read toml for sending: %v", err)
@@ -781,12 +821,4 @@ func sendConfigFiles(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
 	if err1 != nil || err2 != nil {
 		log.Printf("Config Delivery: Failed to route DMs to Telegram User ID %d", msg.From.ID)
 	}
-}
-
-func scheduleDeletion(bot *tgbotapi.BotAPI, chatID int64, messageID int) {
-	go func() {
-		time.Sleep(15 * time.Second)
-		deleteConfig := tgbotapi.NewDeleteMessage(chatID, messageID)
-		_, _ = bot.Request(deleteConfig)
-	}()
 }
